@@ -1,237 +1,425 @@
-# Copyright (c) OpenMMLab. All rights reserved.
-import warnings
-
 import torch
-from mmcv.cnn import build_conv_layer, build_norm_layer
-from mmcv.runner import BaseModule
 from torch import nn
-
+from mmcv.cnn import (build_norm_layer, build_conv_layer, build_plugin_layer,
+                      constant_init)
+import torch.utils.checkpoint as cp
+from mmcv.runner import load_checkpoint
+from mmdet.utils import get_root_logger
+from torch.nn.modules.batchnorm import _BatchNorm
 from ..builder import BACKBONES
 
 
-def dla_build_norm_layer(cfg, num_features):
-    """Build normalization layer specially designed for DLANet.
-    Args:
-        cfg (dict): The norm layer config, which should contain:
-            - type (str): Layer type.
-            - layer args: Args needed to instantiate a norm layer.
-            - requires_grad (bool, optional): Whether stop gradient updates.
-        num_features (int): Number of input channels.
-    Returns:
-        Function: Build normalization layer in mmcv.
-    """
-    cfg_ = cfg.copy()
-    if cfg_['type'] == 'GN':
-        if num_features % 32 == 0:
-            return build_norm_layer(cfg_, num_features)
-        else:
-            assert 'num_groups' in cfg_
-            cfg_['num_groups'] = cfg_['num_groups'] // 2
-            return build_norm_layer(cfg_, num_features)
-    else:
-        return build_norm_layer(cfg_, num_features)
-
-
-class BasicBlock(BaseModule):
-    """BasicBlock in DLANet.
-    Args:
-        in_channels (int): Input feature channel.
-        out_channels (int): Output feature channel.
-        norm_cfg (dict): Dictionary to construct and config
-            norm layer.
-        conv_cfg (dict): Dictionary to construct and config
-            conv layer.
-        stride (int, optional): Conv stride. Default: 1.
-        dilation (int, optional): Conv dilation. Default: 1.
-        init_cfg (dict, optional): Initialization config.
-            Default: None.
-    """
+class BasicBlock(nn.Module):
 
     def __init__(self,
-                 in_channels,
-                 out_channels,
-                 norm_cfg,
-                 conv_cfg,
+                 inplanes,
+                 planes,
                  stride=1,
                  dilation=1,
-                 init_cfg=None):
-        super(BasicBlock, self).__init__(init_cfg)
+                 downsample=None,
+                 style='pytorch',
+                 with_cp=False,
+                 conv_cfg=None,
+                 norm_cfg=dict(type='BN'),
+                 dcn=None,
+                 plugins=None):
+        super(BasicBlock, self).__init__()
+        assert dcn is None, 'Not implemented yet.'
+        assert plugins is None, 'Not implemented yet.'
+
+        self.norm1_name, norm1 = build_norm_layer(norm_cfg, planes, postfix=1)
+        self.norm2_name, norm2 = build_norm_layer(norm_cfg, planes, postfix=2)
+
         self.conv1 = build_conv_layer(
             conv_cfg,
-            in_channels,
-            out_channels,
-            3,
+            inplanes,
+            planes,
+            kernel_size=3,
             stride=stride,
             padding=dilation,
             dilation=dilation,
             bias=False)
-        self.norm1 = dla_build_norm_layer(norm_cfg, out_channels)[1]
+
+        self.add_module(self.norm1_name, norm1)
+
         self.relu = nn.ReLU(inplace=True)
+
         self.conv2 = build_conv_layer(
             conv_cfg,
-            out_channels,
-            out_channels,
-            3,
+            planes,
+            planes,
+            kernel_size=3,
             stride=1,
             padding=dilation,
-            dilation=dilation,
-            bias=False)
-        self.norm2 = dla_build_norm_layer(norm_cfg, out_channels)[1]
+            bias=False,
+            dilation=dilation)
+
+        self.add_module(self.norm2_name, norm2)
+
+        self.downsample = downsample
         self.stride = stride
+        self.dilation = dilation
+        self.with_cp = with_cp
+
+    @property
+    def norm1(self):
+        return getattr(self, self.norm1_name)
+
+    @property
+    def norm2(self):
+        return getattr(self, self.norm2_name)
 
     def forward(self, x, identity=None):
-        """Forward function."""
 
-        if identity is None:
-            identity = x
-        out = self.conv1(x)
-        out = self.norm1(out)
-        out = self.relu(out)
-        out = self.conv2(out)
-        out = self.norm2(out)
-        out += identity
+        def _inner_forward(x, identity):
+
+            if identity is None:
+                identity = x
+
+            out = self.conv1(x)
+            out = self.norm1(out)
+            out = self.relu(out)
+
+            out = self.conv2(out)
+            out = self.norm2(out)
+
+            if self.downsample is not None:
+                identity = self.downsample(x)
+
+            out += identity
+
+            return out
+
+        if self.with_cp and x.requires_grad:
+            out = cp.checkpoint(_inner_forward, x, identity)
+        else:
+            out = _inner_forward(x, identity)
+
         out = self.relu(out)
 
         return out
 
 
-class Root(BaseModule):
-    """Root in DLANet.
-    Args:
-        in_channels (int): Input feature channel.
-        out_channels (int): Output feature channel.
-        norm_cfg (dict): Dictionary to construct and config
-            norm layer.
-        conv_cfg (dict): Dictionary to construct and config
-            conv layer.
-        kernel_size (int): Size of convolution kernel.
-        add_identity (bool): Whether to add identity in root.
-        init_cfg (dict, optional): Initialization config.
-            Default: None.
-    """
+class Bottleneck(nn.Module):
+    expansion = 2
+
+    def __init__(self,
+                 inplanes,
+                 planes,
+                 stride=1,
+                 dilation=1,
+                 downsample=None,
+                 style='pytorch',
+                 with_cp=False,
+                 conv_cfg=None,
+                 norm_cfg=dict(type='BN'),
+                 dcn=None,
+                 plugins=None):
+        super(Bottleneck, self).__init__()
+        assert style in ['pytorch', 'caffe']
+        assert dcn is None or isinstance(dcn, dict)
+        assert plugins is None or isinstance(plugins, list)
+        if plugins is not None:
+            allowed_position = ['after_conv1', 'after_conv2', 'after_conv3']
+            assert all(p['position'] in allowed_position for p in plugins)
+
+        self.style = style
+        self.with_cp = with_cp
+        self.conv_cfg = conv_cfg
+        self.with_dcn = dcn is not None
+        self.with_plugins = plugins is not None
+
+        if self.with_plugins:
+            # collect plugins for conv1/conv2/conv3
+            self.after_conv1_plugins = [
+                plugin['cfg'] for plugin in plugins
+                if plugin['position'] == 'after_conv1'
+            ]
+            self.after_conv2_plugins = [
+                plugin['cfg'] for plugin in plugins
+                if plugin['position'] == 'after_conv2'
+            ]
+            self.after_conv3_plugins = [
+                plugin['cfg'] for plugin in plugins
+                if plugin['position'] == 'after_conv3'
+            ]
+
+        if self.style == 'pytorch':
+            self.conv1_stride = 1
+            self.conv2_stride = stride
+        else:
+            self.conv1_stride = stride
+            self.conv2_stride = 1
+
+        expansion = self.expansion
+        bottle_planes = planes // expansion
+
+        self.norm1_name, norm1 = build_norm_layer(
+            norm_cfg, bottle_planes, postfix=1)
+        self.norm2_name, norm2 = build_norm_layer(
+            norm_cfg, bottle_planes, postfix=2)
+        self.norm3_name, norm3 = build_norm_layer(norm_cfg, planes, postfix=3)
+
+        self.conv1 = build_conv_layer(
+            conv_cfg,
+            inplanes,
+            bottle_planes,
+            kernel_size=1,
+            stride=self.conv1_stride,
+            bias=False)
+
+        self.add_module(self.norm1_name, norm1)
+        fallback_on_stride = False
+        if self.with_dcn:
+            fallback_on_stride = dcn.pop('fallback_on_stride', False)
+        if not self.with_dcn or fallback_on_stride:
+            self.conv2 = build_conv_layer(
+                conv_cfg,
+                bottle_planes,
+                bottle_planes,
+                kernel_size=3,
+                stride=self.conv2_stride,
+                padding=dilation,
+                dilation=dilation,
+                bias=False)
+        else:
+            assert self.conv_cfg is None, 'conv_cfg must be None for DCN'
+            self.conv2 = build_conv_layer(
+                dcn,
+                bottle_planes,
+                bottle_planes,
+                kernel_size=3,
+                stride=self.conv2_stride,
+                padding=dilation,
+                dilation=dilation,
+                bias=False)
+        self.add_module(self.norm2_name, norm2)
+        self.conv3 = build_conv_layer(
+            conv_cfg, bottle_planes, planes, kernel_size=1, bias=False)
+        self.add_module(self.norm3_name, norm3)
+        self.relu = nn.ReLU(inplace=True)
+        self.downsample = downsample
+
+        if self.with_plugins:
+            self.after_conv1_plugin_names = self.make_block_plugins(
+                bottle_planes, self.after_conv1_plugins)
+            self.after_conv2_plugin_names = self.make_block_plugins(
+                bottle_planes, self.after_conv2_plugins)
+            self.after_conv3_plugin_names = self.make_block_plugins(
+                planes, self.after_conv3_plugins)
+
+    def make_block_plugins(self, in_channels, plugins):
+        """make plugins for block.
+        Args:
+            in_channels (int): Input channels of plugin.
+            plugins (list[dict]): List of plugins cfg to build.
+        Returns:
+            list[str]: List of the names of plugin.
+        """
+        assert isinstance(plugins, list)
+        plugin_names = []
+        for plugin in plugins:
+            plugin = plugin.copy()
+            name, layer = build_plugin_layer(
+                plugin,
+                in_channels=in_channels,
+                postfix=plugin.pop('postfix', ''))
+            assert not hasattr(self, name), f'duplicate plugin {name}'
+            self.add_module(name, layer)
+            plugin_names.append(name)
+        return plugin_names
+
+    def forward_plugin(self, x, plugin_names):
+        out = x
+        for name in plugin_names:
+            out = getattr(self, name)(x)
+        return out
+
+    @property
+    def norm1(self):
+        """nn.Module: normalization layer after the first convolution layer"""
+        return getattr(self, self.norm1_name)
+
+    @property
+    def norm2(self):
+        """nn.Module: normalization layer after the second convolution layer"""
+        return getattr(self, self.norm2_name)
+
+    @property
+    def norm3(self):
+        """nn.Module: normalization layer after the third convolution layer"""
+        return getattr(self, self.norm3_name)
+
+    def forward(self, x, identity=None):
+
+        def _inner_forward(x, identity):
+            if identity is None:
+                identity = x
+
+            out = self.conv1(x)
+            out = self.norm1(out)
+            out = self.relu(out)
+
+            if self.with_plugins:
+                out = self.forward_plugin(out, self.after_conv1_plugin_names)
+
+            out = self.conv2(out)
+            out = self.norm2(out)
+            out = self.relu(out)
+
+            if self.with_plugins:
+                out = self.forward_plugin(out, self.after_conv2_plugin_names)
+
+            out = self.conv3(out)
+            out = self.norm3(out)
+
+            if self.with_plugins:
+                out = self.forward_plugin(out, self.after_conv3_plugin_names)
+
+            if self.downsample is not None:
+                identity = self.downsample(x)
+
+            out += identity
+
+            return out
+
+        if self.with_cp and x.requires_grad:
+            out = cp.checkpoint(_inner_forward, x, identity)
+        else:
+            out = _inner_forward(x, identity)
+
+        out = self.relu(out)
+
+        return out
+
+
+class Root(nn.Module):
 
     def __init__(self,
                  in_channels,
                  out_channels,
-                 norm_cfg,
-                 conv_cfg,
                  kernel_size,
-                 add_identity,
-                 init_cfg=None):
-        super(Root, self).__init__(init_cfg)
+                 residual,
+                 conv_cfg=None,
+                 norm_cfg=dict(type='BN')):
+        super(Root, self).__init__()
         self.conv = build_conv_layer(
             conv_cfg,
             in_channels,
             out_channels,
-            1,
+            kernel_size,
             stride=1,
-            padding=(kernel_size - 1) // 2,
-            bias=False)
-        self.norm = dla_build_norm_layer(norm_cfg, out_channels)[1]
+            bias=False,
+            padding=(kernel_size - 1) // 2)
+        self.norm_name, norm = build_norm_layer(norm_cfg, out_channels)
+        self.add_module(self.norm_name, norm)
         self.relu = nn.ReLU(inplace=True)
-        self.add_identity = add_identity
+        self.residual = residual
 
-    def forward(self, feat_list):
-        """Forward function.
-        Args:
-            feat_list (list[torch.Tensor]): Output features from
-                multiple layers.
-        """
-        children = feat_list
-        x = self.conv(torch.cat(feat_list, 1))
+    @property
+    def norm(self):
+        """nn.Module: the normalization layer named "norm1" """
+        return getattr(self, self.norm_name)
+
+    def forward(self, *x):
+        children = x
+        x = self.conv(torch.cat(x, 1))
         x = self.norm(x)
-        if self.add_identity:
+        if self.residual:
             x += children[0]
         x = self.relu(x)
 
         return x
 
 
-class Tree(BaseModule):
-    """Tree in DLANet.
-    Args:
-        levels (int): The level of the tree.
-        block (nn.Module): The block module in tree.
-        in_channels: Input feature channel.
-        out_channels: Output feature channel.
-        norm_cfg (dict): Dictionary to construct and config
-            norm layer.
-        conv_cfg (dict): Dictionary to construct and config
-            conv layer.
-        stride (int, optional): Convolution stride.
-            Default: 1.
-        level_root (bool, optional): whether belongs to the
-            root layer.
-        root_dim (int, optional): Root input feature channel.
-        root_kernel_size (int, optional): Size of root
-            convolution kernel. Default: 1.
-        dilation (int, optional): Conv dilation. Default: 1.
-        add_identity (bool, optional): Whether to add
-            identity in root. Default: False.
-        init_cfg (dict, optional): Initialization config.
-            Default: None.
-    """
+class Tree(nn.Module):
 
     def __init__(self,
                  levels,
                  block,
                  in_channels,
                  out_channels,
-                 norm_cfg,
-                 conv_cfg,
                  stride=1,
                  level_root=False,
-                 root_dim=None,
+                 root_dim=0,
                  root_kernel_size=1,
                  dilation=1,
-                 add_identity=False,
-                 init_cfg=None):
-        super(Tree, self).__init__(init_cfg)
-        if root_dim is None:
+                 root_residual=False,
+                 conv_cfg=None,
+                 norm_cfg=dict(type='BN'),
+                 with_cp=False,
+                 dcn=None,
+                 plugins=None,
+                 style='pytorch'):
+        super(Tree, self).__init__()
+        if root_dim == 0:
             root_dim = 2 * out_channels
         if level_root:
             root_dim += in_channels
         if levels == 1:
-            self.root = Root(root_dim, out_channels, norm_cfg, conv_cfg,
-                             root_kernel_size, add_identity)
             self.tree1 = block(
                 in_channels,
                 out_channels,
-                norm_cfg,
-                conv_cfg,
                 stride,
-                dilation=dilation)
+                dilation=dilation,
+                conv_cfg=conv_cfg,
+                norm_cfg=norm_cfg,
+                with_cp=with_cp,
+                dcn=dcn,
+                plugins=plugins,
+                style=style)
             self.tree2 = block(
                 out_channels,
                 out_channels,
-                norm_cfg,
-                conv_cfg,
                 1,
-                dilation=dilation)
+                dilation=dilation,
+                conv_cfg=conv_cfg,
+                norm_cfg=norm_cfg,
+                with_cp=with_cp,
+                dcn=dcn,
+                plugins=plugins,
+                style=style)
         else:
             self.tree1 = Tree(
                 levels - 1,
                 block,
                 in_channels,
                 out_channels,
-                norm_cfg,
-                conv_cfg,
                 stride,
-                root_dim=None,
+                root_dim=0,
                 root_kernel_size=root_kernel_size,
                 dilation=dilation,
-                add_identity=add_identity)
+                root_residual=root_residual,
+                conv_cfg=conv_cfg,
+                norm_cfg=norm_cfg,
+                with_cp=with_cp,
+                dcn=dcn,
+                plugins=plugins,
+                style=style)
             self.tree2 = Tree(
                 levels - 1,
                 block,
                 out_channels,
                 out_channels,
-                norm_cfg,
-                conv_cfg,
                 root_dim=root_dim + out_channels,
                 root_kernel_size=root_kernel_size,
                 dilation=dilation,
-                add_identity=add_identity)
+                root_residual=root_residual,
+                conv_cfg=conv_cfg,
+                norm_cfg=norm_cfg,
+                with_cp=with_cp,
+                dcn=dcn,
+                plugins=plugins,
+                style=style)
+
+        if levels == 1:
+            self.root = Root(
+                root_dim,
+                out_channels,
+                root_kernel_size,
+                root_residual,
+                conv_cfg=conv_cfg,
+                norm_cfg=norm_cfg)
         self.level_root = level_root
         self.root_dim = root_dim
         self.downsample = None
@@ -245,22 +433,21 @@ class Tree(BaseModule):
                     conv_cfg,
                     in_channels,
                     out_channels,
-                    1,
+                    kernel_size=1,
                     stride=1,
                     bias=False),
-                dla_build_norm_layer(norm_cfg, out_channels)[1])
+                build_norm_layer(norm_cfg, out_channels)[1])
 
-    def forward(self, x, identity=None, children=None):
+    def forward(self, x, residual=None, children=None):
         children = [] if children is None else children
         bottom = self.downsample(x) if self.downsample else x
-        identity = self.project(bottom) if self.project else bottom
+        residual = self.project(bottom) if self.project else bottom
         if self.level_root:
             children.append(bottom)
-        x1 = self.tree1(x, identity)
+        x1 = self.tree1(x, residual)
         if self.levels == 1:
             x2 = self.tree2(x1)
-            feat_list = [x2, x1] + children
-            x = self.root(feat_list)
+            x = self.root(x2, x1, *children)
         else:
             children.append(x1)
             x = self.tree2(x1, children=children)
@@ -268,144 +455,121 @@ class Tree(BaseModule):
 
 
 @BACKBONES.register_module()
-class DLANet(BaseModule):
-    r"""`DLA backbone <https://arxiv.org/abs/1707.06484>`_.
-    Args:
-        depth (int): Depth of DLA. Default: 34.
-        in_channels (int, optional): Number of input image channels.
-            Default: 3.
-        norm_cfg (dict, optional): Dictionary to construct and config
-            norm layer. Default: None.
-        conv_cfg (dict, optional): Dictionary to construct and config
-            conv layer. Default: None.
-        layer_with_level_root (list[bool], optional): Whether to apply
-            level_root in each DLA layer, this is only used for
-            tree levels. Default: (False, True, True, True).
-        with_identity_root (bool, optional): Whether to add identity
-            in root layer. Default: False.
-        pretrained (str, optional): model pretrained path.
-            Default: None.
-        init_cfg (dict or list[dict], optional): Initialization
-            config dict. Default: None
-    """
+class DLANet(nn.Module):
+
     arch_settings = {
-        34: (BasicBlock, (1, 1, 1, 2, 2, 1), (16, 32, 64, 128, 256, 512)),
+        34: (BasicBlock, [1, 1, 1, 2, 2, 1], [16, 32, 64, 128, 256, 512]),
+        46: (Bottleneck, [1, 1, 1, 2, 2, 1], [16, 32, 64, 64, 128, 256]),
+        60: (Bottleneck, [1, 1, 1, 2, 3, 1], [16, 32, 128, 256, 512, 1024]),
+        102: (Bottleneck, [1, 1, 1, 3, 4, 1], [16, 32, 128, 256, 512, 1024]),
+        169: (Bottleneck, [1, 1, 2, 3, 5, 1], [16, 32, 128, 256, 512, 1024])
     }
 
     def __init__(self,
                  depth,
                  in_channels=3,
-                 out_indices=(0, 1, 2, 3, 4, 5),
+                 num_stages=4,
+                 out_indices=(0, 1, 2, 3),
+                 strides=(2, 2, 2, 2),
+                 style='pytorch',
                  frozen_stages=-1,
-                 norm_cfg=None,
                  conv_cfg=None,
-                 layer_with_level_root=(False, True, True, True),
-                 with_identity_root=False,
-                 pretrained=None,
-                 init_cfg=None):
-        super(DLANet, self).__init__(init_cfg)
+                 norm_cfg=dict(type='BN', requires_grad=True),
+                 norm_eval=True,
+                 dcn=None,
+                 stage_with_dcn=(False, False, False, False),
+                 plugins=None,
+                 with_cp=False,
+                 zero_init_residual=True,
+                 stage_with_level_root=(False, True, True, True),
+                 residual_root=False):
+        super(DLANet, self).__init__()
         if depth not in self.arch_settings:
-            raise KeyError(f'invalida depth {depth} for DLA')
-
-        assert not (init_cfg and pretrained), \
-            'init_cfg and pretrained cannot be setting at the same time'
-        if isinstance(pretrained, str):
-            warnings.warn('DeprecationWarning: pretrained is a deprecated, '
-                          'please use "init_cfg" instead')
-            self.init_cfg = dict(type='Pretrained', checkpoint=pretrained)
-        elif pretrained is None:
-            if init_cfg is None:
-                self.init_cfg = [
-                    dict(type='Kaiming', layer='Conv2d'),
-                    dict(
-                        type='Constant',
-                        val=1,
-                        layer=['_BatchNorm', 'GroupNorm'])
-                ]
-
+            raise KeyError(f'invalid depth {depth} for DLA')
         block, levels, channels = self.arch_settings[depth]
-        self.channels = channels
-        self.num_levels = len(levels)
+        self.conv_cfg = conv_cfg
+        self.norm_cfg = norm_cfg
+        self.zero_init_residual = zero_init_residual
         self.frozen_stages = frozen_stages
+        self.num_stages = num_stages
+        assert num_stages >= 1 and num_stages <= 4
         self.out_indices = out_indices
-        assert max(out_indices) < self.num_levels
+        assert max(out_indices) < num_stages
+        self.style = style
+        self.with_cp = with_cp
+        self.norm_eval = norm_eval
+        self.dcn = dcn
+        self.stage_with_dcn = stage_with_dcn
         self.base_layer = nn.Sequential(
             build_conv_layer(
-                conv_cfg,
+                self.conv_cfg,
                 in_channels,
                 channels[0],
-                7,
+                kernel_size=7,
                 stride=1,
                 padding=3,
                 bias=False),
-            dla_build_norm_layer(norm_cfg, channels[0])[1],
+            build_norm_layer(self.norm_cfg, channels[0])[1],
             nn.ReLU(inplace=True))
 
-        # DLANet first uses two conv layers then uses several
-        # Tree layers
         for i in range(2):
             level_layer = self._make_conv_level(
-                channels[0],
-                channels[i],
-                levels[i],
-                norm_cfg,
-                conv_cfg,
-                stride=i + 1)
+                channels[0], channels[i], levels[i], stride=i + 1)
             layer_name = f'level{i}'
             self.add_module(layer_name, level_layer)
 
-        for i in range(2, self.num_levels):
+        for i in range(self.num_stages):
+            dcn = self.dcn if self.stage_with_dcn[i] else None
+            if plugins is not None:
+                stage_plugins = self.make_stage_plugins(plugins, i)
+            else:
+                stage_plugins = None
             dla_layer = Tree(
-                levels[i],
+                levels[i + 2],
                 block,
-                channels[i - 1],
-                channels[i],
-                norm_cfg,
-                conv_cfg,
-                2,
-                level_root=layer_with_level_root[i - 2],
-                add_identity=with_identity_root)
-            layer_name = f'level{i}'
+                channels[i + 1],
+                channels[i + 2],
+                strides[i],
+                level_root=stage_with_level_root[i],
+                root_residual=residual_root,
+                conv_cfg=self.conv_cfg,
+                norm_cfg=self.norm_cfg,
+                dcn=dcn,
+                plugins=stage_plugins,
+                style=self.style)
+            layer_name = f'layer{i + 1}'
             self.add_module(layer_name, dla_layer)
 
         self._freeze_stages()
 
-    def _make_conv_level(self,
-                         in_channels,
-                         out_channels,
-                         num_convs,
-                         norm_cfg,
-                         conv_cfg,
-                         stride=1,
-                         dilation=1):
-        """Conv modules.
-        Args:
-            in_channels (int): Input feature channel.
-            out_channels (int): Output feature channel.
-            num_convs (int): Number of Conv module.
-            norm_cfg (dict): Dictionary to construct and config
-                norm layer.
-            conv_cfg (dict): Dictionary to construct and config
-                conv layer.
-            stride (int, optional): Conv stride. Default: 1.
-            dilation (int, optional): Conv dilation. Default: 1.
-        """
+    def make_stage_plugins(self, plugins, stage_idx):
+        stage_plugins = []
+        for plugin in plugins:
+            plugin = plugin.copy()
+            stages = plugin.pop('stages', None)
+            assert stages is None or len(stages) == self.num_stages
+            if stages is None or stages[stage_idx]:
+                stage_plugins.append(plugin)
+
+        return stage_plugins
+
+    def _make_conv_level(self, inplanes, planes, convs, stride=1, dilation=1):
         modules = []
-        for i in range(num_convs):
+        for i in range(convs):
             modules.extend([
                 build_conv_layer(
-                    conv_cfg,
-                    in_channels,
-                    out_channels,
-                    3,
+                    self.conv_cfg,
+                    inplanes,
+                    planes,
+                    kernel_size=3,
                     stride=stride if i == 0 else 1,
                     padding=dilation,
                     bias=False,
                     dilation=dilation),
-                dla_build_norm_layer(norm_cfg, out_channels)[1],
+                build_norm_layer(self.norm_cfg, planes)[1],
                 nn.ReLU(inplace=True)
             ])
-            in_channels = out_channels
+            inplanes = planes
         return nn.Sequential(*modules)
 
     def _freeze_stages(self):
@@ -421,16 +585,54 @@ class DLANet(BaseModule):
                     param.requires_grad = False
 
         for i in range(1, self.frozen_stages + 1):
-            m = getattr(self, f'level{i+1}')
+            m = getattr(self, f'layer{i}')
             m.eval()
             for param in m.parameters():
                 param.requires_grad = False
 
+    def init_weights(self, pretrained=None):
+        if isinstance(pretrained, str):
+            logger = get_root_logger()
+            load_checkpoint(self, pretrained, strict=False, logger=logger)
+        elif pretrained is None:
+            for m in self.modules():
+                if isinstance(m, nn.Conv2d):
+                    n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
+                    m.weight.data.normal_(0, torch.tensor(2. / n).sqrt())
+                elif isinstance(m, (_BatchNorm, nn.GroupNorm)):
+                    m.weight.data.fill_(1)
+                    m.bias.data.zero_()
+
+            if self.dcn is not None:
+                for m in self.modules():
+                    if isinstance(m, Bottleneck) and hasattr(
+                            m.conv2, 'conv_offset'):
+                        constant_init(m.conv2.conv_offset, 0)
+
+            if self.zero_init_residual:
+                for m in self.modules():
+                    if isinstance(m, Bottleneck):
+                        constant_init(m.norm3, 0)
+                    elif isinstance(m, BasicBlock):
+                        constant_init(m.norm2, 0)
+        else:
+            raise TypeError('pretrained must be a str or None')
+
     def forward(self, x):
-        outs = []
         x = self.base_layer(x)
-        for i in range(self.num_levels):
+        for i in range(2):
             x = getattr(self, 'level{}'.format(i))(x)
+        outs = []
+        for i, index in enumerate(range(1, self.num_stages + 1)):
+            x = getattr(self, 'layer{}'.format(index))(x)
             if i in self.out_indices:
                 outs.append(x)
         return tuple(outs)
+
+    def train(self, mode=True):
+        super(DLANet, self).train(mode)
+        self._freeze_stages()
+        if mode and self.norm_eval:
+            for m in self.modules():
+                if isinstance(m, _BatchNorm):
+                    m.eval()
